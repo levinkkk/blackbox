@@ -1,9 +1,14 @@
 #import <Foundation/Foundation.h>
 
+#ifdef __IPHONE_4_0
+  #define PROTOCOL_IMPLEMENTATION <NSNetServiceDelegate>
+#else
+  #define PROTOCOL_IMPLEMENTATION
+#endif
+
 @class AsyncSocket;
 
-
-@interface HTTPServer : NSObject <NSNetServiceDelegate>
+@interface HTTPServer : NSObject PROTOCOL_IMPLEMENTATION
 {
 	// Underlying asynchronous TCP/IP socket
 	AsyncSocket *asyncSocket;
