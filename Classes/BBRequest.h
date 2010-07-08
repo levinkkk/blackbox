@@ -25,7 +25,7 @@
 //
 
 #import <Foundation/Foundation.h>
-
+#import <CFNetwork/CFNetwork.h>
 
 // Functions
 NSString *BBNormalizeHeaderName(NSString *headerName);
