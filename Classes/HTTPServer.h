@@ -1,14 +1,14 @@
 #import <Foundation/Foundation.h>
 
-#ifdef __IPHONE_4_0
-  #define PROTOCOL_IMPLEMENTATION <NSNetServiceDelegate>
-#else
-  #define PROTOCOL_IMPLEMENTATION
-#endif
-
 @class AsyncSocket;
 
-@interface HTTPServer : NSObject PROTOCOL_IMPLEMENTATION
+#if MAC_OS_X_VERSION_MIN_REQUIRED <= MAC_OS_X_VERSION_10_5
+  #define IMPLEMENTED_PROTOCOLS 
+#else
+  #define IMPLEMENTED_PROTOCOLS <NSNetServiceDelegate>
+#endif
+
+@interface HTTPServer : NSObject IMPLEMENTED_PROTOCOLS
 {
 	// Underlying asynchronous TCP/IP socket
 	AsyncSocket *asyncSocket;
@@ -56,9 +56,9 @@
 - (NSDictionary *)TXTRecordDictionary;
 - (void)setTXTRecordDictionary:(NSDictionary *)dict;
 
-- (BOOL)start:(NSError **)error;
+- (BOOL)start:(NSError **)errPtr;
 - (BOOL)stop;
 
-- (uint)numberOfHTTPConnections;
+- (NSUInteger)numberOfHTTPConnections;
 
 @end

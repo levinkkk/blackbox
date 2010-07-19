@@ -49,6 +49,8 @@
 - (NSString *)realm;
 - (NSString *)passwordForUser:(NSString *)username;
 
+- (NSString *)requestURI;
+
 - (NSString *)filePathForURI:(NSString *)path;
 
 - (NSObject<HTTPResponse> *)httpResponseForMethod:(NSString *)method URI:(NSString *)path;
@@ -65,6 +67,7 @@
 - (NSData *)preprocessResponse:(CFHTTPMessageRef)response;
 - (NSData *)preprocessErrorResponse:(CFHTTPMessageRef)response;
 
+- (BOOL)shouldDie;
 - (void)die;
 
 @end

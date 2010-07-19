@@ -8,8 +8,6 @@
 #import "DDData.h"
 #import "HTTPAsyncFileResponse.h"
 
-// MODIFIED: Matt Patenaude, 2/18/10
-#import "BBDataResponse.h"
 
 // Define chunk size used to read in data for responses
 // This is how much data will be read from disk into RAM at a time
@@ -40,15 +38,18 @@
 #define LIMIT_MAX_HEADER_LINES         100
 
 // Define the various tags we'll use to differentiate what it is we're currently doing
-#define HTTP_REQUEST_HEADER                15
-#define HTTP_REQUEST_BODY                  16
-#define HTTP_PARTIAL_RESPONSE              24
-#define HTTP_PARTIAL_RESPONSE_HEADER       25
-#define HTTP_PARTIAL_RESPONSE_BODY         26
-#define HTTP_PARTIAL_RANGE_RESPONSE_BODY   28
-#define HTTP_PARTIAL_RANGES_RESPONSE_BODY  29
-#define HTTP_RESPONSE                      30
-#define HTTP_FINAL_RESPONSE                45
+#define HTTP_REQUEST_HEADER                10
+#define HTTP_REQUEST_BODY                  11
+#define HTTP_PARTIAL_RESPONSE              20
+#define HTTP_PARTIAL_RESPONSE_HEADER       21
+#define HTTP_PARTIAL_RESPONSE_BODY         22
+#define HTTP_CHUNKED_RESPONSE_HEADER       30
+#define HTTP_CHUNKED_RESPONSE_BODY         31
+#define HTTP_CHUNKED_RESPONSE_FOOTER       32
+#define HTTP_PARTIAL_RANGE_RESPONSE_BODY   40
+#define HTTP_PARTIAL_RANGES_RESPONSE_BODY  50
+#define HTTP_RESPONSE                      90
+#define HTTP_FINAL_RESPONSE                91
 
 // A quick note about the tags:
 // 
@@ -63,9 +64,9 @@
 // tag of your own invention.
 
 @interface HTTPConnection (PrivateAPI)
-- (CFHTTPMessageRef)prepareUniRangeResponse:(UInt64)contentLength;
-- (CFHTTPMessageRef)prepareMultiRangeResponse:(UInt64)contentLength;
-- (NSData *)chunkedTransferSizeLineForLength:(unsigned int)length;
+- (CFHTTPMessageRef)newUniRangeResponse:(UInt64)contentLength;
+- (CFHTTPMessageRef)newMultiRangeResponse:(UInt64)contentLength;
+- (NSData *)chunkedTransferSizeLineForLength:(NSUInteger)length;
 - (NSData *)chunkedTransferFooter;
 @end
 
@@ -511,6 +512,69 @@ static NSMutableArray *recentNonces;
 #pragma mark Core
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/** 
+ * Parses the query variables in the request URI. 
+ * 
+ * For example, if the request URI was "search?q=John%20Mayer%20Trio&num=50" 
+ * then this method would return the following dictionary: 
+ * { 
+ *   q = "John Mayer Trio" 
+ *   num = "50" 
+ * } 
+**/ 
+- (NSDictionary *)parseRequestQuery 
+{
+	if(request == NULL) return nil;
+	if(!CFHTTPMessageIsHeaderComplete(request)) return nil;
+	
+	CFURLRef url = CFHTTPMessageCopyRequestURL(request);
+	if(url == NULL) return nil;
+	
+	NSString *query = [NSMakeCollectable(CFURLCopyQueryString(url, NULL)) autorelease];
+	
+	NSArray *components = [query componentsSeparatedByString:@"&"];
+	NSMutableDictionary *result = [NSMutableDictionary dictionaryWithCapacity:[components count]];
+	
+	NSUInteger i;
+	for(i = 0; i < [components count]; i++)
+	{ 
+		NSString *component = [components objectAtIndex:i];
+		if([component length] > 0)
+		{
+			NSRange range = [component rangeOfString:@"="];
+			if(range.location != NSNotFound)
+			{ 
+				NSString *escapedKey = [component substringToIndex:(range.location + 0)]; 
+				NSString *escapedValue = [component substringFromIndex:(range.location + 1)];
+				
+				if([escapedKey length] > 0)
+				{
+					CFStringRef k, v;
+					
+					k = CFURLCreateStringByReplacingPercentEscapes(NULL, (CFStringRef)escapedKey, CFSTR(""));
+					v = CFURLCreateStringByReplacingPercentEscapes(NULL, (CFStringRef)escapedValue, CFSTR(""));
+					
+					NSString *key, *value;
+					
+					key   = [NSMakeCollectable(k) autorelease];
+					value = [NSMakeCollectable(v) autorelease];
+					
+					if(key)
+					{
+						if(value)
+							[result setObject:value forKey:key]; 
+						else 
+							[result setObject:[NSNull null] forKey:key]; 
+					}
+				}
+			}
+		}
+	}
+	
+	CFRelease(url); 
+	return result; 
+}
+
 /**
  * Attempts to parse the given range header into a series of sequential non-overlapping ranges.
  * If successfull, the variables 'ranges' and 'rangeIndex' will be updated, and YES will be returned.
@@ -661,12 +725,29 @@ static NSMutableArray *recentNonces;
 	return YES;
 }
 
+- (NSString *)requestURI
+{
+	if (request == NULL) return nil;
+	
+	NSURL *uri = [NSMakeCollectable(CFHTTPMessageCopyRequestURL(request)) autorelease];
+	
+	return [uri relativeString];
+}
+
 /**
  * This method is called after a full HTTP request has been received.
  * The current request is in the CFHTTPMessage request variable.
 **/
 - (void)replyToHTTPRequest
 {
+//	NSData *tempData = (NSData *)CFHTTPMessageCopySerializedMessage(request);
+//	NSString *tempStr = [[NSString alloc] initWithData:tempData encoding:NSUTF8StringEncoding];
+//	
+//	NSLog(@"HTTPConnection:%p replyToHTTPRequest:\n%@", self, tempStr);
+//	
+//	[tempStr release];
+//	[tempData release];
+	
 	// Check the HTTP version - if it's anything but HTTP version 1.1, we don't support it
 	NSString *version = [NSMakeCollectable(CFHTTPMessageCopyVersion(request)) autorelease];
 	if(!version || ![version isEqualToString:(NSString *)kCFHTTPVersion1_1])
@@ -681,18 +762,18 @@ static NSMutableArray *recentNonces;
 	// Note: We already checked to ensure the method was supported in onSocket:didReadData:withTag:
 	
 	// Extract requested URI
-	NSURL *uri = [NSMakeCollectable(CFHTTPMessageCopyRequestURL(request)) autorelease];
+	NSString *uri = [self requestURI];
 	
 	// Check Authentication (if needed)
 	// If not properly authenticated for resource, issue Unauthorized response
-	if([self isPasswordProtected:[uri relativeString]] && ![self isAuthenticated])
+	if([self isPasswordProtected:uri] && ![self isAuthenticated])
 	{
 		[self handleAuthenticationFailed];
 		return;
 	}
 	
 	// Respond properly to HTTP 'GET' and 'HEAD' commands
-	httpResponse = [[self httpResponseForMethod:method URI:[uri relativeString]] retain];
+	httpResponse = [[self httpResponseForMethod:method URI:uri] retain];
 	
 	if(httpResponse == nil)
 	{
@@ -739,12 +820,7 @@ static NSMutableArray *recentNonces;
 	if(!isRangeRequest)
 	{
 		// Status Code 200 - OK
-		// MODIFIED: Matt Patenaude, 1/18/10
-		NSInteger statusCode = 200;
-		if ([httpResponse respondsToSelector:@selector(statusCode)])
-			statusCode = [(BBDataResponse *)httpResponse statusCode];
-		
-		response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, statusCode, NULL, kCFHTTPVersion1_1);
+		response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 200, NULL, kCFHTTPVersion1_1);
 		
 		if(isChunked)
 		{
@@ -760,11 +836,11 @@ static NSMutableArray *recentNonces;
 	{
 		if([ranges count] == 1)
 		{
-			response = [self prepareUniRangeResponse:contentLength];
+			response = [self newUniRangeResponse:contentLength];
 		}
 		else
 		{
-			response = [self prepareMultiRangeResponse:contentLength];
+			response = [self newMultiRangeResponse:contentLength];
 		}
 	}
 	
@@ -792,14 +868,14 @@ static NSMutableArray *recentNonces;
 			
 			if([data length] > 0)
 			{
-				[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+				[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 				
 				if(isChunked)
 				{
 					NSData *chunkSize = [self chunkedTransferSizeLineForLength:[data length]];
-					[asyncSocket writeData:chunkSize withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_HEADER];
+					[asyncSocket writeData:chunkSize withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_CHUNKED_RESPONSE_HEADER];
 					
-					[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_BODY];
+					[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_CHUNKED_RESPONSE_BODY];
 					
 					if([httpResponse isDone])
 					{
@@ -809,7 +885,7 @@ static NSMutableArray *recentNonces;
 					else
 					{
 						NSData *footer = [AsyncSocket CRLFData];
-						[asyncSocket writeData:footer withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_HEADER];
+						[asyncSocket writeData:footer withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_CHUNKED_RESPONSE_FOOTER];
 					}
 				}
 				else
@@ -830,13 +906,13 @@ static NSMutableArray *recentNonces;
 				
 				[httpResponse setOffset:range.location];
 				
-				unsigned int bytesToRead = range.length < READ_CHUNKSIZE ? range.length : READ_CHUNKSIZE;
+				NSUInteger bytesToRead = range.length < READ_CHUNKSIZE ? (NSUInteger)range.length : READ_CHUNKSIZE;
 				
 				NSData *data = [httpResponse readDataOfLength:bytesToRead];
 				
 				if([data length] > 0)
 				{
-					[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+					[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 					
 					long tag = [data length] == range.length ? HTTP_RESPONSE : HTTP_PARTIAL_RANGE_RESPONSE_BODY;
 					[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:tag];
@@ -848,21 +924,21 @@ static NSMutableArray *recentNonces;
 				// We have to send each range using multipart/byteranges
 				
 				// Write range header
-				NSData *rangeHeader = [ranges_headers objectAtIndex:0];
-				[asyncSocket writeData:rangeHeader withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_HEADER];
+				NSData *rangeHeaderData = [ranges_headers objectAtIndex:0];
+				[asyncSocket writeData:rangeHeaderData withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_HEADER];
 				
 				// Start writing range body
 				DDRange range = [[ranges objectAtIndex:0] ddrangeValue];
 				
 				[httpResponse setOffset:range.location];
 				
-				unsigned int bytesToRead = range.length < READ_CHUNKSIZE ? range.length : READ_CHUNKSIZE;
+				NSUInteger bytesToRead = range.length < READ_CHUNKSIZE ? (NSUInteger)range.length : READ_CHUNKSIZE;
 				
 				NSData *data = [httpResponse readDataOfLength:bytesToRead];
 				
 				if([data length] > 0)
 				{
-					[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+					[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 					
 					[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_PARTIAL_RANGES_RESPONSE_BODY];
 				}
@@ -878,7 +954,7 @@ static NSMutableArray *recentNonces;
  * 
  * Note: The returned CFHTTPMessageRef is owned by the sender, who is responsible for releasing it.
 **/
-- (CFHTTPMessageRef)prepareUniRangeResponse:(UInt64)contentLength
+- (CFHTTPMessageRef)newUniRangeResponse:(UInt64)contentLength
 {
 	// Status Code 206 - Partial Content
 	CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 206, NULL, kCFHTTPVersion1_1);
@@ -900,7 +976,7 @@ static NSMutableArray *recentNonces;
  * 
  * Note: The returned CFHTTPMessageRef is owned by the sender, who is responsible for releasing it.
 **/
-- (CFHTTPMessageRef)prepareMultiRangeResponse:(UInt64)contentLength
+- (CFHTTPMessageRef)newMultiRangeResponse:(UInt64)contentLength
 {
 	// Status Code 206 - Partial Content
 	CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 206, NULL, kCFHTTPVersion1_1);
@@ -935,7 +1011,7 @@ static NSMutableArray *recentNonces;
 	
 	UInt64 actualContentLength = 0;
 	
-	unsigned i;
+	NSUInteger i;
 	for(i = 0; i < [ranges count]; i++)
 	{
 		DDRange range = [[ranges objectAtIndex:i] ddrangeValue];
@@ -970,9 +1046,9 @@ static NSMutableArray *recentNonces;
  * Returns the chunk size line that must precede each chunk of data when using chunked transfer encoding.
  * This consists of the size of the data, in hexadecimal, followed by a CRLF.
 **/
-- (NSData *)chunkedTransferSizeLineForLength:(unsigned int)length
+- (NSData *)chunkedTransferSizeLineForLength:(NSUInteger)length
 {
-	return [[NSString stringWithFormat:@"%x\r\n", length] dataUsingEncoding:NSUTF8StringEncoding];
+	return [[NSString stringWithFormat:@"%lx\r\n", (unsigned long)length] dataUsingEncoding:NSUTF8StringEncoding];
 }
 
 /**
@@ -995,14 +1071,14 @@ static NSMutableArray *recentNonces;
  * We keep track of this information in order to keep our memory footprint low while
  * working with asynchronous HTTPResponse objects.
 **/
-- (unsigned int)writeQueueSize
+- (NSUInteger)writeQueueSize
 {
-	unsigned int result = 0;
+	NSUInteger result = 0;
 	
-	unsigned int i;
+	NSUInteger i;
 	for(i = 0; i < [responseDataSizes count]; i++)
 	{
-		result += [[responseDataSizes objectAtIndex:i] unsignedIntValue];
+		result += [[responseDataSizes objectAtIndex:i] unsignedIntegerValue];
 	}
 	
 	return result;
@@ -1030,16 +1106,16 @@ static NSMutableArray *recentNonces;
 	// This provides an easy way for the HTTPResponse object to throttle its data allocation in step with the rate
 	// at which the socket is able to send it.
 	
-	unsigned int writeQueueSize = [self writeQueueSize];
+	NSUInteger writeQueueSize = [self writeQueueSize];
 	
 	if(writeQueueSize >= READ_CHUNKSIZE) return;
 	
-	unsigned int available = READ_CHUNKSIZE - writeQueueSize;
+	NSUInteger available = READ_CHUNKSIZE - writeQueueSize;
 	NSData *data = [httpResponse readDataOfLength:available];
 	
 	if([data length] > 0)
 	{
-		[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+		[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 		
 		BOOL isChunked = NO;
 		
@@ -1051,9 +1127,9 @@ static NSMutableArray *recentNonces;
 		if(isChunked)
 		{
 			NSData *chunkSize = [self chunkedTransferSizeLineForLength:[data length]];
-			[asyncSocket writeData:chunkSize withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_HEADER];
+			[asyncSocket writeData:chunkSize withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_CHUNKED_RESPONSE_HEADER];
 			
-			[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_BODY];
+			[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_CHUNKED_RESPONSE_BODY];
 			
 			if([httpResponse isDone])
 			{
@@ -1063,7 +1139,7 @@ static NSMutableArray *recentNonces;
 			else
 			{
 				NSData *footer = [AsyncSocket CRLFData];
-				[asyncSocket writeData:footer withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_PARTIAL_RESPONSE_HEADER];
+				[asyncSocket writeData:footer withTimeout:WRITE_HEAD_TIMEOUT tag:HTTP_CHUNKED_RESPONSE_FOOTER];
 			}
 		}
 		else
@@ -1096,7 +1172,7 @@ static NSMutableArray *recentNonces;
 	// This provides an easy way for the HTTPResponse object to throttle its data allocation in step with the rate
 	// at which the socket is able to send it.
 	
-	unsigned int writeQueueSize = [self writeQueueSize];
+	NSUInteger writeQueueSize = [self writeQueueSize];
 	
 	if(writeQueueSize >= READ_CHUNKSIZE) return;
 	
@@ -1108,14 +1184,14 @@ static NSMutableArray *recentNonces;
 	
 	if(bytesLeft > 0)
 	{
-		unsigned int available = READ_CHUNKSIZE - writeQueueSize;
-		unsigned int bytesToRead = bytesLeft < available ? bytesLeft : available;
+		NSUInteger available = READ_CHUNKSIZE - writeQueueSize;
+		NSUInteger bytesToRead = bytesLeft < available ? (NSUInteger)bytesLeft : available;
 		
 		NSData *data = [httpResponse readDataOfLength:bytesToRead];
 		
 		if([data length] > 0)
 		{
-			[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+			[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 			
 			long tag = [data length] == bytesLeft ? HTTP_RESPONSE : HTTP_PARTIAL_RANGE_RESPONSE_BODY;
 			[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:tag];
@@ -1145,7 +1221,7 @@ static NSMutableArray *recentNonces;
 	// This provides an easy way for the HTTPResponse object to throttle its data allocation in step with the rate
 	// at which the socket is able to send it.
 	
-	unsigned int writeQueueSize = [self writeQueueSize];
+	NSUInteger writeQueueSize = [self writeQueueSize];
 	
 	if(writeQueueSize >= READ_CHUNKSIZE) return;
 	
@@ -1157,14 +1233,14 @@ static NSMutableArray *recentNonces;
 	
 	if(bytesLeft > 0)
 	{
-		unsigned int available = READ_CHUNKSIZE - writeQueueSize;
-		unsigned int bytesToRead = bytesLeft < available ? bytesLeft : available;
+		NSUInteger available = READ_CHUNKSIZE - writeQueueSize;
+		NSUInteger bytesToRead = bytesLeft < available ? (NSUInteger)bytesLeft : available;
 		
 		NSData *data = [httpResponse readDataOfLength:bytesToRead];
 		
 		if([data length] > 0)
 		{
-			[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+			[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 			
 			[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_PARTIAL_RANGES_RESPONSE_BODY];
 		}
@@ -1182,14 +1258,14 @@ static NSMutableArray *recentNonces;
 			
 			[httpResponse setOffset:range.location];
 			
-			unsigned int available = READ_CHUNKSIZE - writeQueueSize;
-			unsigned int bytesToRead = range.length < available ? range.length : available;
+			NSUInteger available = READ_CHUNKSIZE - writeQueueSize;
+			NSUInteger bytesToRead = range.length < available ? (NSUInteger)range.length : available;
 			
 			NSData *data = [httpResponse readDataOfLength:bytesToRead];
 			
 			if([data length] > 0)
 			{
-				[responseDataSizes addObject:[NSNumber numberWithUnsignedInt:[data length]]];
+				[responseDataSizes addObject:[NSNumber numberWithUnsignedInteger:[data length]]];
 				
 				[asyncSocket writeData:data withTimeout:WRITE_BODY_TIMEOUT tag:HTTP_PARTIAL_RANGES_RESPONSE_BODY];
 			}
@@ -1322,7 +1398,7 @@ static NSMutableArray *recentNonces;
 	// If you simply want to add a few extra header fields, see the preprocessErrorResponse: method.
 	// You can also use preprocessErrorResponse: to add an optional HTML body.
 	
-	NSLog(@"HTTP Server: Error 505 - Version Not Supported: %@", version);
+	NSLog(@"HTTP Server: Error 505 - Version Not Supported: %@ (%@)", version, [self requestURI]);
 	
 	CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 505, NULL, kCFHTTPVersion1_1);
 	CFHTTPMessageSetHeaderFieldValue(response, CFSTR("Content-Length"), CFSTR("0"));
@@ -1342,7 +1418,7 @@ static NSMutableArray *recentNonces;
 	// If you simply want to add a few extra header fields, see the preprocessErrorResponse: method.
 	// You can also use preprocessErrorResponse: to add an optional HTML body.
 	
-	NSLog(@"HTTP Server: Error 401 - Unauthorized");
+	NSLog(@"HTTP Server: Error 401 - Unauthorized (%@)", [self requestURI]);
 		
 	// Status Code 401 - Unauthorized
 	CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 401, NULL, kCFHTTPVersion1_1);
@@ -1374,7 +1450,7 @@ static NSMutableArray *recentNonces;
 	// If you simply want to add a few extra header fields, see the preprocessErrorResponse: method.
 	// You can also use preprocessErrorResponse: to add an optional HTML body.
 	
-	NSLog(@"HTTP Server: Error 400 - Bad Request");
+	NSLog(@"HTTP Server: Error 400 - Bad Request (%@)", [self requestURI]);
 	
 	// Status Code 400 - Bad Request
 	CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 400, NULL, kCFHTTPVersion1_1);
@@ -1403,7 +1479,7 @@ static NSMutableArray *recentNonces;
 	// 
 	// See also: supportsMethod:atPath:
 	
-	NSLog(@"HTTP Server: Error 405 - Method Not Allowed: %@", method);
+	NSLog(@"HTTP Server: Error 405 - Method Not Allowed: %@ (%@)", method, [self requestURI]);
 	
 	// Status code 405 - Method Not Allowed
     CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 405, NULL, kCFHTTPVersion1_1);
@@ -1429,7 +1505,7 @@ static NSMutableArray *recentNonces;
 	// If you simply want to add a few extra header fields, see the preprocessErrorResponse: method.
 	// You can also use preprocessErrorResponse: to add an optional HTML body.
 	
-	NSLog(@"HTTP Server: Error 404 - Not Found");
+	NSLog(@"HTTP Server: Error 404 - Not Found (%@)", [self requestURI]);
 	
 	// Status Code 404 - Not Found
 	CFHTTPMessageRef response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, 404, NULL, kCFHTTPVersion1_1);
@@ -1486,7 +1562,7 @@ static NSMutableArray *recentNonces;
 		NSEnumerator *keyEnumerator = [responseHeaders keyEnumerator];
 		NSString *key;
 		
-		while(key = [keyEnumerator nextObject])
+		while((key = [keyEnumerator nextObject]))
 		{
 			NSString *value = [responseHeaders objectForKey:key];
 			
@@ -1519,7 +1595,7 @@ static NSMutableArray *recentNonces;
 	//     
 	//     CFHTTPMessageSetBody(response, (CFDataRef)msgData);
 	//     
-	//     NSString *contentLengthStr = [NSString stringWithFormat:@"%u", (unsigned)[msgData length]];
+	//     NSString *contentLengthStr = [NSString stringWithFormat:@"%lu", (unsigned long)[msgData length]];
 	//     CFHTTPMessageSetHeaderFieldValue(response, CFSTR("Content-Length"), (CFStringRef)contentLengthStr);
 	// }
 	
@@ -1538,7 +1614,7 @@ static NSMutableArray *recentNonces;
 		NSEnumerator *keyEnumerator = [responseHeaders keyEnumerator];
 		NSString *key;
 		
-		while(key = [keyEnumerator nextObject])
+		while((key = [keyEnumerator nextObject]))
 		{
 			NSString *value = [responseHeaders objectForKey:key];
 			
@@ -1647,7 +1723,7 @@ static NSMutableArray *recentNonces;
 			NSString *method = [NSMakeCollectable(CFHTTPMessageCopyRequestMethod(request)) autorelease];
 			
 			// Extract the uri (such as "/index.html")
-			NSURL *uri = [NSMakeCollectable(CFHTTPMessageCopyRequestURL(request)) autorelease];
+			NSString *uri = [self requestURI];
 			
 			// Check for a Content-Length field
 			NSString *contentLength =
@@ -1655,7 +1731,7 @@ static NSMutableArray *recentNonces;
 			
 			// Content-Length MUST be present for upload methods (such as POST or PUT)
 			// and MUST NOT be present for other methods.
-			BOOL expectsUpload = [self expectsRequestBodyFromMethod:method atPath:[uri relativeString]];
+			BOOL expectsUpload = [self expectsRequestBodyFromMethod:method atPath:uri];
 			
 			if(expectsUpload)
 			{
@@ -1699,7 +1775,7 @@ static NSMutableArray *recentNonces;
 			}
 			
 			// Check to make sure the given method is supported
-			if(![self supportsMethod:method atPath:[uri relativeString]])
+			if(![self supportsMethod:method atPath:uri])
 			{
 				// The method is unsupported - either in general, or for this specific request
 				// Send a 405 - Method not allowed response
@@ -1716,7 +1792,11 @@ static NSMutableArray *recentNonces;
 				[self prepareForBodyWithSize:requestContentLength];
 				
 				// Start reading the request body
-				uint bytesToRead = requestContentLength < POST_CHUNKSIZE ? requestContentLength : POST_CHUNKSIZE;
+				NSUInteger bytesToRead;
+				if(requestContentLength < POST_CHUNKSIZE)
+					bytesToRead = (NSUInteger)requestContentLength;
+				else
+					bytesToRead = POST_CHUNKSIZE;
 				
 				[asyncSocket readDataToLength:bytesToRead withTimeout:READ_TIMEOUT tag:HTTP_REQUEST_BODY];
 			}
@@ -1739,7 +1819,7 @@ static NSMutableArray *recentNonces;
 			// We're not done reading the post body yet...
 			UInt64 bytesLeft = requestContentLength - requestContentLengthReceived;
 			
-			uint bytesToRead = bytesLeft < POST_CHUNKSIZE ? bytesLeft : POST_CHUNKSIZE;
+			NSUInteger bytesToRead = bytesLeft < POST_CHUNKSIZE ? (NSUInteger)bytesLeft : POST_CHUNKSIZE;
 			
 			[asyncSocket readDataToLength:bytesToRead withTimeout:READ_TIMEOUT tag:HTTP_REQUEST_BODY];
 		}
@@ -1764,6 +1844,20 @@ static NSMutableArray *recentNonces;
 		[responseDataSizes removeObjectAtIndex:0];
 		
 		// We only wrote a part of the response - there may be more
+		[self continueSendingStandardResponseBody];
+	}
+	else if(tag == HTTP_CHUNKED_RESPONSE_BODY)
+	{
+		// Update the amount of data we have in asyncSocket's write queue.
+		// This will allow asynchronous responses to continue sending more data.
+		[responseDataSizes removeObjectAtIndex:0];
+		
+		// Don't continue sending the response yet.
+		// The chunked footer that was sent after the body will tell us if we have more data to send.
+	}
+	else if(tag == HTTP_CHUNKED_RESPONSE_FOOTER)
+	{
+		// Normal chunked footer indicating we have more data to send (non final footer).
 		[self continueSendingStandardResponseBody];
 	}
 	else if(tag == HTTP_PARTIAL_RANGE_RESPONSE_BODY)
@@ -1825,17 +1919,24 @@ static NSMutableArray *recentNonces;
 			ranges_headers = nil;
 			ranges_boundry = nil;
 			
-			// Release the old request, and create a new one
-			if(request) CFRelease(request);
-			request = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, YES);
-			
-			numHeaderLines = 0;
-			
-			// And start listening for more requests
-			[asyncSocket readDataToData:[AsyncSocket CRLFData]
-							withTimeout:READ_TIMEOUT
-							  maxLength:LIMIT_MAX_HEADER_LINE_LENGTH
-									tag:HTTP_REQUEST_HEADER];
+			if([self shouldDie])
+			{
+				[self die];
+			}
+			else
+			{
+				// Release the old request, and create a new one
+				if(request) CFRelease(request);
+				request = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, YES);
+				
+				numHeaderLines = 0;
+				
+				// And start listening for more requests
+				[asyncSocket readDataToData:[AsyncSocket CRLFData]
+								withTimeout:READ_TIMEOUT
+								  maxLength:LIMIT_MAX_HEADER_LINE_LENGTH
+										tag:HTTP_REQUEST_HEADER];
+			}
 		}
 	}
 }
@@ -1887,6 +1988,13 @@ static NSMutableArray *recentNonces;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Closing
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+- (BOOL)shouldDie
+{
+	// Override me if you want to force close the connection after the response has been fully sent.
+	
+	return NO;
+}
 
 - (void)die
 {
