@@ -85,9 +85,12 @@ void BBParseQueryIntoDictionary(NSString *queryString, NSMutableDictionary *dict
 		BBParseQueryIntoDictionary(queryString, getParams);			
 		[requestURL release];
 		
-		postParams = [[NSMutableDictionary alloc] init];
-		if (![[self postString] isEqualToString:@""])
-			BBParseQueryIntoDictionary([self postString], postParams);
+// FIXME: Before parsing the POST body, we should test for the "application/x-www-form-urlencoded"
+// Content-Type.
+		
+//		postParams = [[NSMutableDictionary alloc] init];
+//		if (![[self postString] isEqualToString:@""])
+//			BBParseQueryIntoDictionary([self postString], postParams);
 	}
 	return self;
 }
